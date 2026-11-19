@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- USB Mass Storage Class (0x08) for OTG Flash Drives, External SSDs/HDDs, and SD Card Readers -->
+    <usb-device class="8" />
+    <!-- USB Hub Class (0x09) for multi-port OTG hubs with SD/microSD slots -->
+    <usb-device class="9" />
+</resources>

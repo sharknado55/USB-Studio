@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="launcher_purple">#23104F</color>
+    <dimen name="launch_logo_size">240dp</dimen>
+
+    <style name="Theme.MyApplication" parent="android:Theme.DeviceDefault.NoActionBar" />
+
+    <style name="Theme.MyApplication.Starting">
+        <item name="android:windowBackground">@drawable/launch_screen</item>
+        <item name="android:statusBarColor">@color/launcher_purple</item>
+        <item name="android:navigationBarColor">@color/launcher_purple</item>
+    </style>
+</resources>
