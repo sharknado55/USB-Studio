@@ -4,7 +4,7 @@
 
 Manage USB drives from an Android phone or tablet. Browse and copy files, format drives, edit partition tables, and write disk images over USB OTG.
 
-**[Download the signed APK](https://github.com/sharknado55/USB-Studio/releases/latest/download/USB-Studio-1.0-signed.apk)** · [Release notes](https://github.com/sharknado55/USB-Studio/releases/latest)
+**[Download the APK](https://github.com/sharknado55/USB-Studio/releases/latest/download/USB-Studio-1.0-signed.apk)** · [Release notes](https://github.com/sharknado55/USB-Studio/releases/latest)
 
 ## Install
 
