@@ -37,22 +37,22 @@ class ExampleRobolectricTest {
 
         // Verify real BlockDiskStructures GPT header & CRC32 round-trip over BlockDeviceTransport
         val blockFile = File(context.cacheDir, "example_block_test.img").apply { delete() }
-        FileBlockTransport(blockFile, totalBlocks = 16384L).use { transport ->
+        FileBlockTransport(blockFile, totalBlocks = 131072L).use { transport ->
             val part = UsbPartition(
                 id = "p1",
                 index = 1,
                 label = "USB_BOOT",
                 fileSystem = FileSystemType.FAT32,
                 startLba = 2048L,
-                sectorCount = 12288L,
-                sizeBytes = 12288L * 512L,
+                sectorCount = 100000L,
+                sizeBytes = 100000L * 512L,
                 usedBytes = 0L
             )
             BlockDiskStructures.writePartitionTable(transport, PartitionScheme.GPT, listOf(part))
             BlockDiskStructures.writeFileSystemAtPartition(
                 transport = transport,
                 startLba = 2048L,
-                sectorCount = 12288L,
+                sectorCount = 100000L,
                 fileSystem = FileSystemType.FAT32,
                 volumeLabel = "USB_BOOT",
                 clusterSize = 4096,

@@ -51,7 +51,7 @@ class UsbDiskEngineTest {
             context = context,
             blockTransportFactory = { drive ->
                 if (drive.supportsRawBlockIo) {
-                    FileBlockTransport(blockBackingFile, totalBlocks = 131072L) // 64 MB test USB block device
+                    FileBlockTransport(blockBackingFile, totalBlocks = 262144L) // 128 MB test USB block device
                 } else {
                     null
                 }
@@ -72,7 +72,7 @@ class UsbDiskEngineTest {
         protocolName = "BOT / Bulk-Only (0x50) • SCSI Direct",
         maxPowerMa = 300,
         hasUsbPermission = true,
-        totalBytes = 131072L * 512L,
+        totalBytes = 262144L * 512L,
         logicalBlockSize = 512,
         partitionScheme = PartitionScheme.MBR,
         partitions = listOf(
@@ -186,7 +186,7 @@ class UsbDiskEngineTest {
     }
 
     @Test
-    fun `raw USB block formatter writes real FAT32, exFAT, EXT4, and NTFS structures readable back from sectors`() = runBlocking {
+    fun `raw USB block formatter writes real FAT32 structures and refuses stub filesystems`() = runBlocking {
         val hwDrive = createHardwareDrive()
 
         // 1. Format as FAT32 + MBR -> verify real FAT32 volume is readable by Fat32FileSystemReader!
@@ -216,7 +216,7 @@ class UsbDiskEngineTest {
         assertTrue(fatEntries.isEmpty())
 
         // Re-read partition layout from raw sectors via BlockDiskStructures
-        FileBlockTransport(blockBackingFile, totalBlocks = 131072L).use { t ->
+        FileBlockTransport(blockBackingFile, totalBlocks = 262144L).use { t ->
             val (probedScheme, probedParts) = BlockDiskStructures.readPartitionLayout(t)
             assertEquals(PartitionScheme.MBR, probedScheme)
             assertEquals(FileSystemType.FAT32, probedParts.first().fileSystem)
@@ -225,48 +225,75 @@ class UsbDiskEngineTest {
             assertTrue(Fat32FileSystemReader(t, probedParts.first().startLba).listDirectory("/").isEmpty())
         }
 
-        // 2. Format as exFAT + GPT
-        val (exfatDrive, _) = engine.formatDriveOrPartition(
+        // 2. Re-format as FAT32 + GPT: primary and backup GPT headers are both written
+        val (gptDrive, _) = engine.formatDriveOrPartition(
             drive = fat32Drive,
             targetPartitionId = null,
-            newLabel = "STUDIO_EX",
-            fileSystem = FileSystemType.EXFAT,
-            clusterSize = 32768,
-            partitionScheme = PartitionScheme.GPT,
-            quickFormat = true,
-            wipeFullDrive = true
-        ) { _, _ -> }
-        val exfatVbr = engine.readRawSector(exfatDrive, exfatDrive.partitions.first().startLba)
-        assertEquals("EXFAT   ", String(exfatVbr, 3, 8, Charsets.US_ASCII))
-
-        // 3. Format as EXT4 + GPT (superblock at startLba + 2 sectors, offset 0x38 magic 0xEF53)
-        val (ext4Drive, _) = engine.formatDriveOrPartition(
-            drive = exfatDrive,
-            targetPartitionId = null,
-            newLabel = "LINUX_VOL",
-            fileSystem = FileSystemType.EXT4,
+            newLabel = "GPT_FAT",
+            fileSystem = FileSystemType.FAT32,
             clusterSize = 4096,
             partitionScheme = PartitionScheme.GPT,
             quickFormat = true,
             wipeFullDrive = true
         ) { _, _ -> }
-        val ext4Super = engine.readRawSector(ext4Drive, ext4Drive.partitions.first().startLba + 2L)
-        val ext4Magic = ByteBuffer.wrap(ext4Super).order(ByteOrder.LITTLE_ENDIAN).getShort(0x38)
-        assertEquals(0xEF53.toShort(), ext4Magic)
+        assertEquals(PartitionScheme.GPT, gptDrive.partitionScheme)
+        assertEquals("EFI PART", String(engine.readRawSector(gptDrive, 262143L), 0, 8, Charsets.US_ASCII))
 
-        // 4. Format as NTFS + MBR
-        val (ntfsDrive, _) = engine.formatDriveOrPartition(
-            drive = ext4Drive,
-            targetPartitionId = null,
-            newLabel = "WIN_NTFS",
-            fileSystem = FileSystemType.NTFS,
-            clusterSize = 4096,
-            partitionScheme = PartitionScheme.MBR,
-            quickFormat = true,
-            wipeFullDrive = true
+        // 3. exFAT, EXT4 and NTFS writers only made stub headers, so they are refused before any write
+        for (fs in listOf(FileSystemType.EXFAT, FileSystemType.EXT4, FileSystemType.NTFS)) {
+            val failed = runCatching {
+                engine.formatDriveOrPartition(
+                    drive = gptDrive,
+                    targetPartitionId = null,
+                    newLabel = "NOPE",
+                    fileSystem = fs,
+                    clusterSize = 4096,
+                    partitionScheme = PartitionScheme.MBR,
+                    quickFormat = true,
+                    wipeFullDrive = true
+                ) { _, _ -> }
+            }.isFailure
+            assertTrue("${fs.label} format must be refused", failed)
+        }
+        assertEquals("EFI PART", String(engine.readRawSector(gptDrive, 1L), 0, 8, Charsets.US_ASCII))
+    }
+
+    @Test
+    fun `formatting one partition leaves the other partitions untouched`() = runBlocking {
+        val blank = createHardwareDrive().copy(partitions = emptyList())
+        val (formatted, _) = engine.formatDriveOrPartition(
+            drive = blank, targetPartitionId = null, newLabel = "WHOLE", fileSystem = FileSystemType.FAT32,
+            clusterSize = 4096, partitionScheme = PartitionScheme.MBR, quickFormat = true, wipeFullDrive = true
         ) { _, _ -> }
-        val ntfsVbr = engine.readRawSector(ntfsDrive, ntfsDrive.partitions.first().startLba)
-        assertEquals("NTFS    ", String(ntfsVbr, 3, 8, Charsets.US_ASCII))
+        val split = listOf(
+            UsbPartition(id = "a", index = 1, label = "FIRST", fileSystem = FileSystemType.FAT32,
+                startLba = 2048L, sectorCount = 100000L, sizeBytes = 100000L * 512L, usedBytes = 0L),
+            UsbPartition(id = "b", index = 2, label = "SECOND", fileSystem = FileSystemType.FAT32,
+                startLba = 102048L, sectorCount = 100000L, sizeBytes = 100000L * 512L, usedBytes = 0L)
+        )
+        val twoParts = engine.commitPartitionTable(formatted, PartitionScheme.MBR, split)
+        val firstVbrBefore = engine.readRawSector(twoParts, 2048L)
+        val second = twoParts.partitions.first { it.startLba == 102048L }
+
+        engine.formatDriveOrPartition(
+            drive = twoParts, targetPartitionId = second.id, newLabel = "SECOND2", fileSystem = FileSystemType.FAT32,
+            clusterSize = 4096, partitionScheme = PartitionScheme.MBR, quickFormat = false, wipeFullDrive = false
+        ) { _, _ -> }
+
+        assertTrue(firstVbrBefore.contentEquals(engine.readRawSector(twoParts, 2048L)))
+        assertEquals("MSDOS5.0", String(engine.readRawSector(twoParts, 102048L), 3, 8, Charsets.US_ASCII))
+    }
+
+    @Test
+    fun `writes are refused when the disk no longer matches the app's partition list`() = runBlocking {
+        val stale = createHardwareDrive() // claims a partition the blank disk does not have
+        val result = runCatching {
+            engine.formatDriveOrPartition(
+                drive = stale, targetPartitionId = "p1", newLabel = "X", fileSystem = FileSystemType.FAT32,
+                clusterSize = 4096, partitionScheme = PartitionScheme.MBR, quickFormat = true, wipeFullDrive = false
+            ) { _, _ -> }
+        }
+        assertTrue(result.isFailure)
     }
 
     @Test
@@ -307,7 +334,7 @@ class UsbDiskEngineTest {
 
     @Test
     fun `commitPartitionTable converts between GPT and MBR and preserves boot flags on real block sectors`() = runBlocking {
-        val hwDrive = createHardwareDrive()
+        val hwDrive = createHardwareDrive().copy(partitions = emptyList()) // blank disk
         val customParts = listOf(
             UsbPartition(
                 id = "p_custom_1",
@@ -315,8 +342,8 @@ class UsbDiskEngineTest {
                 label = "BOOT_PART",
                 fileSystem = FileSystemType.FAT32,
                 startLba = 2048L,
-                sectorCount = 65536L,
-                sizeBytes = 32L * 1024 * 1024,
+                sectorCount = 80000L,
+                sizeBytes = 80000L * 512L,
                 usedBytes = 0L,
                 isBootable = true,
                 flags = listOf("BOOT")
@@ -325,10 +352,10 @@ class UsbDiskEngineTest {
                 id = "p_custom_2",
                 index = 2,
                 label = "DATA_PART",
-                fileSystem = FileSystemType.EXT4,
-                startLba = 67584L,
-                sectorCount = 60000L,
-                sizeBytes = 60000L * 512L,
+                fileSystem = FileSystemType.FAT32,
+                startLba = 82048L,
+                sectorCount = 80000L,
+                sizeBytes = 80000L * 512L,
                 usedBytes = 0L,
                 isBootable = false
             )
@@ -340,7 +367,7 @@ class UsbDiskEngineTest {
         assertEquals(0x80.toByte(), mbrLba0[0x1BE])
         assertEquals(FileSystemType.FAT32.code, mbrLba0[0x1BE + 4])
         assertEquals(0x00.toByte(), mbrLba0[0x1BE + 16])
-        assertEquals(FileSystemType.EXT4.code, mbrLba0[0x1BE + 16 + 4])
+        assertEquals(FileSystemType.FAT32.code, mbrLba0[0x1BE + 16 + 4])
 
         val gptCommitted = engine.commitPartitionTable(mbrCommitted, PartitionScheme.GPT, customParts)
         assertEquals(PartitionScheme.GPT, gptCommitted.partitionScheme)

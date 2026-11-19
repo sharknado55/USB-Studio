@@ -263,7 +263,20 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        refreshRateController.applyOptimalRefreshRate()
+        refreshRateController.onUserInteraction()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        refreshRateController.onInactive()
+    }
+
+    // Called by Activity for every touch, key or trackball event: switch back to the highest rate.
+    override fun onUserInteraction() {
+        super.onUserInteraction()
+        if (::refreshRateController.isInitialized) {
+            refreshRateController.onUserInteraction()
+        }
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {

@@ -79,6 +79,7 @@ import com.example.ui.components.Md3BadgeVariant
 import com.example.ui.components.Md3Button
 import com.example.ui.components.Md3ButtonVariant
 import com.example.ui.components.Md3Card
+import com.example.ui.components.Md3ConfirmDialog
 import com.example.ui.components.Md3Input
 import com.example.ui.components.Md3NoDriveEmptyState
 import com.example.ui.components.Md3SelectChip
@@ -118,6 +119,7 @@ fun PartitionManagerScreen(
     BackHandler(enabled = isCurrentTab) { onBackToDrives() }
 
     var createTargetUnalloc by remember { mutableStateOf<UsbPartition?>(null) }
+    var confirmCommit by remember { mutableStateOf(false) }
 
     if (drive == null) {
         Md3NoDriveEmptyState(
@@ -409,7 +411,7 @@ fun PartitionManagerScreen(
                             icon = Icons.Outlined.Check,
                             variant = Md3ButtonVariant.GoldAccent,
                             compact = true,
-                            onClick = onCommitTable,
+                            onClick = { confirmCommit = true },
                             modifier = Modifier.weight(1.45f),
                             testTag = "commit_partition_table_button"
                         )
@@ -428,6 +430,28 @@ fun PartitionManagerScreen(
                 modifier = Modifier.animateItem()
             )
         }
+    }
+
+    if (confirmCommit) {
+        val active = stagedPartitions.filter { it.fileSystem != FileSystemType.UNALLOCATED }
+        Md3ConfirmDialog(
+            title = "Write the new partition table?",
+            message = "Deleted partitions and their files are lost. New partitions are formatted. This cannot be undone.",
+            details = listOf(
+                "Drive" to drive.name,
+                "Capacity" to if (drive.totalBytes > 0L) formatBytes(drive.totalBytes) else "Unknown",
+                "Serial" to drive.serialNumber,
+                "Scheme" to "${drive.partitionScheme.name} to ${stagedScheme.name}",
+                "Partitions" to active.joinToString { "${it.label} (${formatBytes(it.sizeBytes)})" }.ifEmpty { "None" }
+            ),
+            confirmText = "Write Table",
+            onConfirm = {
+                confirmCommit = false
+                onCommitTable()
+            },
+            onDismiss = { confirmCommit = false },
+            confirmTestTag = "confirm_partition_commit_button"
+        )
     }
 
     val unallocTarget = createTargetUnalloc
@@ -558,13 +582,14 @@ private fun CreatePartitionDialog(
     onDismiss: () -> Unit,
     onConfirm: (label: String, fs: FileSystemType, sizeMb: Long, bootable: Boolean) -> Unit
 ) {
-    val maxMb = (unallocatedSlice.sizeBytes / (1024L * 1024L)).coerceAtLeast(64L)
+    // Free space is the sector count; never offer more than that.
+    val maxMb = (unallocatedSlice.sectorCount * 512L / (1024L * 1024L)).coerceAtLeast(34L)
     var label by remember { mutableStateOf("") }
-    var fs by remember { mutableStateOf(FileSystemType.EXFAT) }
+    var fs by remember { mutableStateOf(FileSystemType.FAT32) }
     var fraction by remember { mutableFloatStateOf(1.0f) }
     var bootable by remember { mutableStateOf(false) }
 
-    val selectedMb = (maxMb * fraction).toLong().coerceIn(32L, maxMb)
+    val selectedMb = (maxMb * fraction).toLong().coerceIn(34L, maxMb)
     val shape = RoundedCornerShape(30.dp)
 
     Dialog(
@@ -640,10 +665,8 @@ private fun CreatePartitionDialog(
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf(
-                        listOf(FileSystemType.EXFAT, FileSystemType.FAT32),
-                        listOf(FileSystemType.EXT4, FileSystemType.NTFS)
-                    ).forEach { rowItems ->
+                    // Only filesystems with a complete, mountable writer are offered.
+                    FileSystemType.entries.filter { it.canFormat }.chunked(2).forEach { rowItems ->
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             rowItems.forEach { item ->
                                 Md3SelectChip(

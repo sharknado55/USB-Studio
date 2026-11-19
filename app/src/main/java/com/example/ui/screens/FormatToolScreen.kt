@@ -1,17 +1,13 @@
 package com.example.ui.screens
 
 import androidx.activity.compose.BackHandler
-import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
-import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.scaleIn
 import androidx.compose.animation.shrinkVertically
-import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -55,6 +51,7 @@ import com.example.ui.components.Md3BadgeVariant
 import com.example.ui.components.Md3Button
 import com.example.ui.components.Md3ButtonVariant
 import com.example.ui.components.Md3Card
+import com.example.ui.components.Md3ConfirmDialog
 import com.example.ui.components.Md3Input
 import com.example.ui.components.Md3NoDriveEmptyState
 import com.example.ui.components.Md3ProgressBar
@@ -215,12 +212,8 @@ fun FormatToolScreen(
                     )
                     Spacer(modifier = Modifier.height(10.dp))
 
-                    val supportedFs = listOf(
-                        FileSystemType.FAT32,
-                        FileSystemType.EXFAT,
-                        FileSystemType.EXT4,
-                        FileSystemType.NTFS
-                    )
+                    // Only filesystems with a complete, mountable writer are offered.
+                    val supportedFs = FileSystemType.entries.filter { it.canFormat }
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         supportedFs.chunked(2).forEach { pair ->
                             Row(
@@ -382,54 +375,52 @@ fun FormatToolScreen(
             Spacer(modifier = Modifier.height(16.dp))
 
             val canExecute = !formatStatus.isRunning && (!drive.supportsRawBlockIo || drive.hasUsbPermission)
-            AnimatedContent(
-                targetState = confirmFormatArmed,
-                transitionSpec = {
-                    (fadeIn(tween(200)) + scaleIn(initialScale = 0.94f, animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy)))
-                        .togetherWith(fadeOut(tween(150)))
-                },
-                label = "formatConfirmButtonTransition"
-            ) { armed ->
-                if (!armed) {
-                    Md3Button(
-                        text = if (drive.supportsRawBlockIo) {
-                            "Format as ${selectedFileSystem.label}"
-                        } else {
-                            "Erase All Files on Volume"
-                        },
-                        icon = Icons.Outlined.Build,
-                        variant = Md3ButtonVariant.GoldAccent,
-                        enabled = canExecute,
-                        onClick = { confirmFormatArmed = true },
-                        modifier = Modifier.fillMaxWidth(),
-                        testTag = "arm_format_button"
-                    )
+            Md3Button(
+                text = if (drive.supportsRawBlockIo) {
+                    "Format as ${selectedFileSystem.label}"
                 } else {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        Md3Button(
-                            text = "Cancel",
-                            variant = Md3ButtonVariant.Outline,
-                            onClick = { confirmFormatArmed = false },
-                            modifier = Modifier.weight(1f)
-                        )
-                        Md3Button(
-                            text = "Confirm Erase",
-                            icon = Icons.Outlined.Build,
-                            variant = Md3ButtonVariant.Destructive,
-                            enabled = canExecute,
-                            onClick = {
-                                confirmFormatArmed = false
-                                onExecuteFormat()
-                            },
-                            modifier = Modifier.weight(1.5f),
-                            testTag = "execute_format_button"
-                        )
-                    }
-                }
-            }
+                    "Erase All Files on Volume"
+                },
+                icon = Icons.Outlined.Build,
+                variant = Md3ButtonVariant.GoldAccent,
+                enabled = canExecute,
+                onClick = { confirmFormatArmed = true },
+                modifier = Modifier.fillMaxWidth(),
+                testTag = "arm_format_button"
+            )
         }
+    }
+
+    if (confirmFormatArmed) {
+        val targetPart = drive.partitions.find { it.id == targetPartitionId }
+        val wholeDrive = !drive.supportsRawBlockIo || wipeFullDrive || targetPart == null
+        Md3ConfirmDialog(
+            title = if (drive.supportsRawBlockIo) "Format this drive?" else "Erase all files?",
+            message = if (!drive.supportsRawBlockIo) {
+                "Every file and folder in this volume will be deleted. This cannot be undone."
+            } else if (wholeDrive) {
+                "Every partition and file on this drive will be erased. This cannot be undone."
+            } else {
+                "Everything in partition '${targetPart?.label}' will be erased. Other partitions are kept."
+            },
+            details = buildList {
+                add("Drive" to drive.name)
+                add("Capacity" to if (drive.totalBytes > 0L) formatBytes(drive.totalBytes) else "Unknown")
+                add("Serial" to drive.serialNumber)
+                add("USB ID" to drive.vidPidHex)
+                if (drive.supportsRawBlockIo) {
+                    add("Target" to if (wholeDrive) "Whole drive" else "${targetPart?.label} (${formatBytes(targetPart?.sizeBytes ?: 0L)})")
+                    add("New format" to "${selectedFileSystem.label}, ${selectedScheme.name}")
+                }
+            },
+            confirmText = "Erase",
+            requiredWord = "ERASE",
+            onConfirm = {
+                confirmFormatArmed = false
+                onExecuteFormat()
+            },
+            onDismiss = { confirmFormatArmed = false },
+            confirmTestTag = "execute_format_button"
+        )
     }
 }

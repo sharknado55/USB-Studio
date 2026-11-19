@@ -12,6 +12,7 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextClearance
@@ -245,6 +246,8 @@ class UsbStudioUiCujTest {
         composeTestRule.onNodeWithTag("file_manager_screen")
             .performScrollToNode(hasTestTag("delete_file_hello.txt"))
         composeTestRule.onNodeWithTag("delete_file_hello.txt").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("confirm_delete_button").performClick()
         waitUntilWithLooper(timeoutMillis = 5000L) {
             viewModel.uiState.value.fileEntries.none { it.name == "hello.txt" }
         }
@@ -262,9 +265,10 @@ class UsbStudioUiCujTest {
         composeTestRule.onNodeWithTag("arm_format_button").performClick()
         composeTestRule.waitForIdle()
 
-        composeTestRule.onNodeWithTag("format_tool_screen")
-            .performScrollToNode(hasTestTag("execute_format_button"))
+        // The confirm dialog stays disabled until ERASE is typed
         composeTestRule.onNodeWithTag("execute_format_button").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("execute_format_button").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("confirm_dialog_input").performTextInput("ERASE")
         composeTestRule.onNodeWithTag("execute_format_button").performClick()
 
         waitUntilWithLooper(timeoutMillis = 12000L) {
@@ -294,6 +298,9 @@ class UsbStudioUiCujTest {
         composeTestRule.onNodeWithTag("iso_writer_screen")
             .performScrollToNode(hasTestTag("execute_iso_flash_button"))
         composeTestRule.onNodeWithTag("execute_iso_flash_button").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("confirm_dialog_input").performTextInput("ERASE")
+        composeTestRule.onNodeWithTag("confirm_iso_flash_button").performClick()
 
         waitUntilWithLooper(timeoutMillis = 15000L) {
             !viewModel.uiState.value.isoFlashStatus.isRunning &&
@@ -313,6 +320,13 @@ class UsbStudioUiCujTest {
     @Test
     fun `cuj6_partition manager stages changes, discards, deletes and reallocates partition, and commits table`() {
         launchApp(mountSampleSafDrives = 1)
+
+        // Give the test disk a real partition table first, as a user would.
+        viewModel.executeFormatOperation()
+        waitUntilWithLooper(timeoutMillis = 12000L) {
+            !viewModel.uiState.value.formatStatus.isRunning &&
+                viewModel.uiState.value.formatStatus.completedVolumeUuid != null
+        }
 
         composeTestRule.onNodeWithTag("nav_tab_partitions").performClick()
         composeTestRule.waitForIdle()
@@ -349,6 +363,8 @@ class UsbStudioUiCujTest {
         composeTestRule.onNodeWithTag("partition_manager_screen")
             .performScrollToNode(hasTestTag("commit_partition_table_button"))
         composeTestRule.onNodeWithTag("commit_partition_table_button").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("confirm_partition_commit_button").performClick()
         waitUntilWithLooper(timeoutMillis = 5000L) {
             !viewModel.uiState.value.hasUncommittedPartitionChanges
         }

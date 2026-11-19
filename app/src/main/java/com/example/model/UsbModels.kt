@@ -57,7 +57,11 @@ enum class FileSystemType(
         clusterSizes = listOf(4096),
         description = "Raw unpartitioned disk sectors available for new volume allocation.",
         maxFileSizeLabel = "Raw LBA"
-    )
+    );
+
+    /** Only FAT32 has a complete, mountable on-disk writer. Other types are detect/read-only. */
+    val canFormat: Boolean
+        get() = this == FAT32
 }
 
 enum class PartitionScheme(val label: String, val description: String) {
@@ -78,7 +82,15 @@ data class UsbPartition(
     val isBootable: Boolean = false,
     val flags: List<String> = emptyList(),
     val typeGuidOrHex: String = "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
-    val uuid: String = "4A8F-9C2E"
+    val uuid: String = "4A8F-9C2E",
+    /** Raw MBR partition type byte read from disk; null for new partitions (derived from [fileSystem]). */
+    val mbrTypeCode: Int? = null,
+    /** Raw on-disk GPT type GUID (16 bytes, hex); null for new partitions. */
+    val gptTypeGuid: String? = null,
+    /** Raw on-disk GPT unique partition GUID (16 bytes, hex); null for new partitions. */
+    val gptUniqueGuid: String? = null,
+    /** Raw GPT attribute bits (bit 2 is mirrored by [isBootable]). */
+    val gptAttributes: Long = 0L
 )
 
 @Immutable
@@ -97,6 +109,8 @@ data class UsbDriveDevice(
     val hasUsbPermission: Boolean,
     val totalBytes: Long,
     val logicalBlockSize: Int = 512,
+    /** Capacity read over SCSI READ CAPACITY during the last scan; 0 when unknown. */
+    val scsiCapacityBytes: Long = 0L,
     val partitionScheme: PartitionScheme,
     val partitions: List<UsbPartition>,
     val safTreeUri: Uri? = null,

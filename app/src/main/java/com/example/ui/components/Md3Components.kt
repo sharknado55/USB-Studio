@@ -49,6 +49,8 @@ import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -1167,3 +1169,98 @@ fun Md3NoDriveEmptyState(
     }
 }
 
+
+/**
+ * Confirmation dialog for destructive drive actions. Shows the exact target ([details]) so the user can
+ * check name, capacity and serial. When [requiredWord] is set, the confirm button stays disabled until
+ * that word is typed.
+ */
+@Composable
+fun Md3ConfirmDialog(
+    title: String,
+    message: String,
+    details: List<Pair<String, String>>,
+    confirmText: String,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+    requiredWord: String? = null,
+    confirmTestTag: String = "confirm_dialog_confirm_button"
+) {
+    var typed by remember { mutableStateOf("") }
+    val canConfirm = requiredWord == null || typed.trim().equals(requiredWord, ignoreCase = false)
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        val shape = RoundedCornerShape(28.dp)
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth(0.92f)
+                .clip(shape)
+                .border(1.5.dp, Coral600.copy(alpha = 0.6f), shape)
+                .testTag("confirm_dialog"),
+            color = MaterialTheme.colorScheme.surface,
+            contentColor = MaterialTheme.colorScheme.onSurface
+        ) {
+            Column(modifier = Modifier.padding(22.dp)) {
+                Text(text = title, style = MaterialTheme.typography.titleLarge)
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = message,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (details.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(14.dp))
+                    details.forEach { (key, value) ->
+                        Row(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+                            Text(
+                                text = key,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.width(96.dp)
+                            )
+                            Text(
+                                text = value,
+                                style = MaterialTheme.typography.bodySmall,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+                }
+                if (requiredWord != null) {
+                    Spacer(modifier = Modifier.height(14.dp))
+                    Md3Input(
+                        value = typed,
+                        onValueChange = { typed = it },
+                        placeholder = requiredWord,
+                        label = "Type $requiredWord to confirm",
+                        testTag = "confirm_dialog_input"
+                    )
+                }
+                Spacer(modifier = Modifier.height(18.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Md3Button(
+                        text = "Cancel",
+                        variant = Md3ButtonVariant.Outline,
+                        onClick = onDismiss,
+                        modifier = Modifier.weight(1f),
+                        testTag = "confirm_dialog_cancel_button"
+                    )
+                    Md3Button(
+                        text = confirmText,
+                        variant = Md3ButtonVariant.Destructive,
+                        enabled = canConfirm,
+                        onClick = onConfirm,
+                        modifier = Modifier.weight(1.4f),
+                        testTag = confirmTestTag
+                    )
+                }
+            }
+        }
+    }
+}

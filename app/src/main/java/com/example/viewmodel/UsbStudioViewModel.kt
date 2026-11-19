@@ -14,6 +14,8 @@ import com.example.model.PartitionScheme
 import com.example.model.UsbDriveDevice
 import com.example.model.UsbFileEntry
 import com.example.model.UsbPartition
+import com.example.service.DiskOperationScope
+import com.example.service.DiskOperationService
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -91,6 +93,7 @@ data class UsbStudioUiState(
     val stagedScheme: PartitionScheme = PartitionScheme.GPT,
     val stagedPartitions: List<UsbPartition> = emptyList(),
     val hasUncommittedPartitionChanges: Boolean = false,
+    val isCommittingPartitions: Boolean = false,
     // Raw Sector / File Hex Inspector
     val activeHexInspection: HexInspectionPayload? = null,
     // Operation Logs
@@ -99,6 +102,10 @@ data class UsbStudioUiState(
 ) {
     val selectedDrive: UsbDriveDevice?
         get() = drives.find { it.id == selectedDriveId } ?: drives.firstOrNull()
+
+    /** True while a format, image flash or partition commit is writing to a drive. */
+    val isDiskOperationRunning: Boolean
+        get() = formatStatus.isRunning || isoFlashStatus.isRunning || isCommittingPartitions
 
     val currentSafDocumentId: String?
         get() = safFolderStack.lastOrNull()?.second
@@ -115,6 +122,11 @@ class UsbStudioViewModel(
     application: Application,
     private val engine: UsbDiskEngine
 ) : AndroidViewModel(application) {
+
+    private companion object {
+        /** Smallest partition that can hold a valid FAT32 volume (65525 clusters of 512 B plus FATs). */
+        const val MIN_PARTITION_BYTES = 34L * 1024 * 1024
+    }
 
     constructor(application: Application) : this(
         application,
@@ -147,6 +159,10 @@ class UsbStudioViewModel(
     }
 
     fun refreshUsbBus() {
+        if (_uiState.value.isDiskOperationRunning) {
+            appendLog("OTG-SCAN", "Rescan skipped: a drive operation is still running.")
+            return
+        }
         viewModelScope.launch {
             _uiState.update { it.copy(isScanningBus = true) }
             val currentDrives = _uiState.value.drives
@@ -219,12 +235,21 @@ class UsbStudioViewModel(
 
     fun mountSafVolume(treeUri: Uri) {
         viewModelScope.launch {
-            val safDrive = engine.createSafMountedDrive(treeUri)
+            val safDrive = try {
+                engine.createSafMountedDrive(treeUri)
+            } catch (e: Exception) {
+                val msg = e.message ?: "That folder cannot be mounted."
+                appendLog("SAF-MOUNT", msg, isError = true)
+                _uiState.update { it.copy(bannerMessage = msg) }
+                return@launch
+            }
             val currentSelected = _uiState.value.selectedDrive
 
             // If a physical USB OTG hardware drive is currently active without SAF folder access,
-            // link this SAF tree directly to it so the user gets unified SCSI + SAF read/write access!
-            if (currentSelected != null && currentSelected.supportsRawBlockIo && currentSelected.safTreeUri == null) {
+            // link this SAF tree to it, but only when the volume's size can belong to that drive.
+            if (currentSelected != null && currentSelected.supportsRawBlockIo && currentSelected.safTreeUri == null &&
+                engine.safTreeFitsDrive(treeUri, currentSelected)
+            ) {
                 val mergedHw = currentSelected.copy(
                     safTreeUri = treeUri,
                     totalBytes = if (currentSelected.totalBytes > 0L) currentSelected.totalBytes else safDrive.totalBytes,
@@ -335,6 +360,7 @@ class UsbStudioViewModel(
             _uiState.update { it.copy(fileEntries = emptyList(), fileListError = null) }
             return
         }
+        if (drive.safTreeUri == null && _uiState.value.isDiskOperationRunning) return
         val path = _uiState.value.currentPath
         val docId = _uiState.value.currentSafDocumentId
         viewModelScope.launch {
@@ -570,9 +596,13 @@ class UsbStudioViewModel(
     fun executeFormatOperation() {
         val state = _uiState.value
         val drive = state.selectedDrive ?: return
-        if (state.formatStatus.isRunning) return
+        if (rejectIfBusy(state)) return
 
-        viewModelScope.launch {
+        // Mark running before the coroutine starts so a second tap cannot start another write.
+        _uiState.update {
+            it.copy(formatStatus = FormatOperationStatus(isRunning = true, stepDescription = "Preparing USB device...", progress = 0.02f))
+        }
+        launchDiskOperation("Formatting ${drive.name}") {
             appendLog(
                 "MKFS",
                 "Starting ${state.formatFileSystem.label} format on ${drive.name} (Label=${state.formatLabel}, Cluster=${state.formatClusterSize}B)"
@@ -681,9 +711,12 @@ class UsbStudioViewModel(
         val drive = state.selectedDrive ?: return
         val sourceUri = state.customIsoUri ?: return
         val sourceTitle = state.customIsoName?.takeIf { it.isNotBlank() } ?: "Image.iso"
-        if (state.isoFlashStatus.isRunning) return
+        if (rejectIfBusy(state)) return
 
-        viewModelScope.launch {
+        _uiState.update {
+            it.copy(isoFlashStatus = IsoFlashStatus(isRunning = true, stage = "Preparing...", progress = 0.01f))
+        }
+        launchDiskOperation("Writing $sourceTitle to ${drive.name}") {
             appendLog("ISO-DD", "Flashing '$sourceTitle' to ${drive.name} (${drive.vidPidHex})...")
 
             _uiState.update {
@@ -718,6 +751,9 @@ class UsbStudioViewModel(
                     }
                 }
 
+                val verifyFailed = state.verifyIsoSha256 && !verified
+                val verifyError = "Verification failed: the data read back from ${drive.name} does not match " +
+                    "$sourceTitle. Do not use this drive; try another drive or port and write again."
                 _uiState.update { s ->
                     val updatedList = s.drives.map { if (it.id == updatedDrive.id) updatedDrive else it }
                     s.copy(
@@ -728,16 +764,24 @@ class UsbStudioViewModel(
                         stagedPartitions = updatedDrive.partitions,
                         isoFlashStatus = s.isoFlashStatus.copy(
                             isRunning = false,
-                            stage = if (verified) "Flash & SHA-256 Read-Back Verified" else "Flash Completed",
+                            stage = when {
+                                verifyFailed -> "Verification Failed"
+                                state.verifyIsoSha256 -> "Flash & SHA-256 Read-Back Verified"
+                                else -> "Flash Completed (not verified)"
+                            },
                             progress = 1.0f,
                             sha256Hex = sha256,
-                            verifiedSuccess = verified,
-                            errorMessage = null
+                            verifiedSuccess = if (state.verifyIsoSha256) verified else null,
+                            errorMessage = if (verifyFailed) verifyError else null
                         ),
-                        bannerMessage = "Flashed $sourceTitle to ${drive.name}"
+                        bannerMessage = if (verifyFailed) verifyError else "Flashed $sourceTitle to ${drive.name}"
                     )
                 }
-                appendLog("ISO-OK", "Flashed $sourceTitle • SHA256=${sha256.take(16)}... Verified=$verified")
+                appendLog(
+                    if (verifyFailed) "ISO-ERR" else "ISO-OK",
+                    "Flashed $sourceTitle • SHA256=${sha256.take(16)}... Verified=$verified",
+                    isError = verifyFailed
+                )
                 refreshCurrentDirectory()
             } catch (e: Exception) {
                 val msg = e.message ?: "Failed to flash selected image."
@@ -832,14 +876,15 @@ class UsbStudioViewModel(
 
         for (part in current) {
             if (part.id == unallocatedId && part.fileSystem == FileSystemType.UNALLOCATED) {
-                val targetBytes = (sizeMb * 1024L * 1024L).coerceAtLeast(32L * 1024 * 1024)
-                val requestedBytes = if (part.sizeBytes > 0L) {
-                    val minBytes = minOf(32L * 1024 * 1024, part.sizeBytes)
-                    targetBytes.coerceIn(minBytes, part.sizeBytes)
-                } else {
-                    targetBytes
+                // Size from the sector count, which is what is really free on disk.
+                val availableBytes = part.sectorCount * blockSize.toLong()
+                val targetBytes = (sizeMb * 1024L * 1024L).coerceAtLeast(MIN_PARTITION_BYTES)
+                val requestedBytes = targetBytes.coerceAtMost(availableBytes)
+                if (requestedBytes < MIN_PARTITION_BYTES) {
+                    _uiState.update { it.copy(bannerMessage = "Not enough free space: a FAT32 partition needs at least 34 MB.") }
+                    return
                 }
-                val requestedSectors = (requestedBytes / blockSize).coerceAtLeast(1L)
+                val requestedSectors = requestedBytes / blockSize
                 val newPart = UsbPartition(
                     id = "part_${UUID.randomUUID().toString().take(6)}",
                     index = 0,
@@ -863,14 +908,14 @@ class UsbStudioViewModel(
                 )
                 result.add(newPart)
 
-                val remainingBytes = (part.sizeBytes - requestedBytes).coerceAtLeast(0L)
-                if (remainingBytes >= 16L * 1024 * 1024) {
+                val remainingSectors = part.sectorCount - requestedSectors
+                if (remainingSectors * blockSize >= MIN_PARTITION_BYTES) {
                     result.add(
                         part.copy(
                             id = "unalloc_${UUID.randomUUID().toString().take(5)}",
                             startLba = part.startLba + requestedSectors,
-                            sectorCount = remainingBytes / blockSize,
-                            sizeBytes = remainingBytes
+                            sectorCount = remainingSectors,
+                            sizeBytes = remainingSectors * blockSize
                         )
                     )
                 }
@@ -913,7 +958,9 @@ class UsbStudioViewModel(
     fun applyStagedPartitionTable() {
         val state = _uiState.value
         val drive = state.selectedDrive ?: return
-        viewModelScope.launch {
+        if (rejectIfBusy(state)) return
+        _uiState.update { it.copy(isCommittingPartitions = true) }
+        launchDiskOperation("Writing partition table to ${drive.name}") {
             try {
                 val updatedDrive = engine.commitPartitionTable(
                     drive = drive,
@@ -927,6 +974,7 @@ class UsbStudioViewModel(
                         stagedScheme = updatedDrive.partitionScheme,
                         stagedPartitions = updatedDrive.partitions,
                         hasUncommittedPartitionChanges = false,
+                        isCommittingPartitions = false,
                         bannerMessage = "Committed ${updatedDrive.partitionScheme.name} partition table (${updatedDrive.partitions.size} entries) to USB LBA 0"
                     )
                 }
@@ -937,7 +985,29 @@ class UsbStudioViewModel(
             } catch (e: Exception) {
                 val msg = e.message ?: "Failed to commit partition table to ${drive.name}."
                 appendLog("PART-ERR", msg, isError = true)
-                _uiState.update { it.copy(bannerMessage = msg) }
+                _uiState.update { it.copy(bannerMessage = msg, isCommittingPartitions = false) }
+            }
+        }
+    }
+
+    private fun rejectIfBusy(state: UsbStudioUiState): Boolean {
+        if (!state.isDiskOperationRunning) return false
+        _uiState.update { it.copy(bannerMessage = "Another drive operation is still running. Wait for it to finish.") }
+        return true
+    }
+
+    /**
+     * Runs a drive write outside viewModelScope, inside a foreground service with a wake lock,
+     * so closing the screen or turning it off cannot stop the write halfway.
+     */
+    private fun launchDiskOperation(title: String, block: suspend () -> Unit) {
+        val app = getApplication<Application>()
+        DiskOperationService.start(app, title)
+        DiskOperationScope.scope.launch {
+            try {
+                block()
+            } finally {
+                DiskOperationService.stop(app)
             }
         }
     }

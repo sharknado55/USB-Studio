@@ -170,11 +170,11 @@ class UsbStudioViewModelTest {
 
         viewModel.updateFormatConfig(
             label = "LINUX_TEST",
-            fileSystem = FileSystemType.EXT4,
+            fileSystem = FileSystemType.FAT32,
             scheme = PartitionScheme.GPT,
             quick = true
         )
-        assertEquals(4096, viewModel.uiState.value.formatClusterSize)
+        assertEquals(16384, viewModel.uiState.value.formatClusterSize)
         assertEquals("LINUX_TEST", viewModel.uiState.value.formatLabel)
 
         viewModel.executeFormatOperation()
@@ -185,7 +185,7 @@ class UsbStudioViewModelTest {
 
         val state = viewModel.uiState.value
         assertEquals(1.0f, state.formatStatus.progress, 0.001f)
-        assertEquals(FileSystemType.EXT4, state.selectedDrive?.primaryFileSystem)
+        assertEquals(FileSystemType.FAT32, state.selectedDrive?.primaryFileSystem)
         assertEquals("LINUX_TEST", state.selectedDrive?.partitions?.first()?.label)
     }
 
@@ -217,10 +217,21 @@ class UsbStudioViewModelTest {
         Unit
     }
 
+    /** Writes a real partition table first, as a user would before editing partitions. */
+    private suspend fun formatWholeTestDrive() {
+        viewModel.updateFormatConfig(fileSystem = FileSystemType.FAT32, wipeFullDrive = true)
+        viewModel.executeFormatOperation()
+        awaitCondition(timeoutMs = 15000L) {
+            !viewModel.uiState.value.formatStatus.isRunning &&
+                viewModel.uiState.value.formatStatus.completedVolumeUuid != null
+        }
+    }
+
     @Test
     fun `partition manager deletes partition into unallocated space, allocates new partition, toggles boot flag, resets, and commits`() = runBlocking {
         awaitCondition { !viewModel.uiState.value.isScanningBus }
         mountSafTestDrive("PART-VOL")
+        formatWholeTestDrive()
         viewModel.selectTab(WorkbenchTab.PARTITIONS)
 
         val initialPartitions = viewModel.uiState.value.stagedPartitions
@@ -236,7 +247,7 @@ class UsbStudioViewModelTest {
         viewModel.createPartitionInUnallocated(
             unallocatedId = afterDelete.first().id,
             label = "MEDIA_VOL",
-            fileSystem = FileSystemType.EXFAT,
+            fileSystem = FileSystemType.FAT32,
             sizeMb = 32L,
             bootable = true
         )
@@ -264,6 +275,7 @@ class UsbStudioViewModelTest {
         mountSafTestDrive("HEX-VOL")
 
         // Write valid MBR first via commitPartitionTable
+        formatWholeTestDrive()
         viewModel.setStagedPartitionScheme(PartitionScheme.MBR)
         viewModel.applyStagedPartitionTable()
         awaitCondition { !viewModel.uiState.value.hasUncommittedPartitionChanges }

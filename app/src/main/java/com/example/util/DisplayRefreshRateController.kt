@@ -43,17 +43,51 @@ fun selectOptimalRefreshRateMode(
 }
 
 /**
- * Locks the Activity window onto the display's highest supported native refresh rate (90Hz, 120Hz,
- * 144Hz, etc.), configures Android 15+ Adaptive Refresh Rate (ARR) touch boost and frame-rate
- * hints, and dynamically re-applies when display modes change (e.g., foldables or Quick Settings).
+ * Selects the power-saving idle mode: the same-resolution mode closest to [idleHz] (60 Hz),
+ * preferring a rate at or above it so the UI never drops below 60 FPS.
  */
-class DisplayRefreshRateController(private val activity: Activity) {
+fun selectIdleRefreshRateMode(
+    currentMode: RefreshRateModeSpec?,
+    supportedModes: List<RefreshRateModeSpec>,
+    idleHz: Float = 60f
+): RefreshRateModeSpec? {
+    if (supportedModes.isEmpty()) return currentMode
+    val sameResolutionModes = if (currentMode != null) {
+        supportedModes.filter {
+            it.physicalWidth == currentMode.physicalWidth &&
+                it.physicalHeight == currentMode.physicalHeight
+        }
+    } else {
+        emptyList()
+    }
+    val candidates = if (sameResolutionModes.isNotEmpty()) sameResolutionModes else supportedModes
+    val atOrAbove = candidates.filter { it.refreshRate >= idleHz - 0.5f }
+    return (atOrAbove.ifEmpty { candidates }).minByOrNull { kotlin.math.abs(it.refreshRate - idleHz) }
+        ?: currentMode
+}
+
+/**
+ * Runs the Activity window at the display's highest supported native refresh rate (90Hz, 120Hz,
+ * 144Hz, etc.) while the user is interacting, and drops to 60 Hz after [idleTimeoutMs] without
+ * touch or key input, or while the app is paused. Configures Android 15+ Adaptive Refresh Rate
+ * (ARR) touch boost and frame-rate hints, and re-applies when display modes change.
+ */
+class DisplayRefreshRateController(
+    private val activity: Activity,
+    private val idleTimeoutMs: Long = 5_000L
+) {
 
     private val displayManager: DisplayManager? =
         activity.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var isRegistered = false
+
+    /** True while the app is inactive (no recent input, or paused): run at 60 Hz to save power. */
+    var isIdle: Boolean = false
+        private set
+
+    private val enterIdleRunnable = Runnable { setIdle(true) }
 
     private val displayListener = object : DisplayManager.DisplayListener {
         override fun onDisplayAdded(displayId: Int) = Unit
@@ -67,7 +101,9 @@ class DisplayRefreshRateController(private val activity: Activity) {
     }
 
     fun start() {
+        isIdle = false
         applyOptimalRefreshRate()
+        scheduleIdle()
         if (!isRegistered) {
             runCatching {
                 displayManager?.registerDisplayListener(displayListener, mainHandler)
@@ -76,7 +112,31 @@ class DisplayRefreshRateController(private val activity: Activity) {
         }
     }
 
+    /** Call on every touch or key event: returns to the highest rate and restarts the idle timer. */
+    fun onUserInteraction() {
+        if (isIdle) setIdle(false)
+        scheduleIdle()
+    }
+
+    /** Call from onPause: the app is not in use, so drop to 60 Hz right away. */
+    fun onInactive() {
+        mainHandler.removeCallbacks(enterIdleRunnable)
+        setIdle(true)
+    }
+
+    private fun scheduleIdle() {
+        mainHandler.removeCallbacks(enterIdleRunnable)
+        mainHandler.postDelayed(enterIdleRunnable, idleTimeoutMs)
+    }
+
+    private fun setIdle(idle: Boolean) {
+        if (isIdle == idle) return
+        isIdle = idle
+        applyOptimalRefreshRate()
+    }
+
     fun stop() {
+        mainHandler.removeCallbacks(enterIdleRunnable)
         if (isRegistered) {
             runCatching {
                 displayManager?.unregisterDisplayListener(displayListener)
@@ -91,8 +151,12 @@ class DisplayRefreshRateController(private val activity: Activity) {
 
         val currentMode = display.mode?.toSpec()
         val supportedModes = display.supportedModes?.map { it.toSpec() }.orEmpty()
-        val bestMode = selectOptimalRefreshRateMode(currentMode, supportedModes)
-        val targetHz = bestMode?.refreshRate ?: display.refreshRate.coerceAtLeast(60f)
+        val bestMode = if (isIdle) {
+            selectIdleRefreshRateMode(currentMode, supportedModes)
+        } else {
+            selectOptimalRefreshRateMode(currentMode, supportedModes)
+        }
+        val targetHz = bestMode?.refreshRate ?: if (isIdle) 60f else display.refreshRate.coerceAtLeast(60f)
 
         val attrs = window.attributes
         var changed = false
@@ -113,9 +177,13 @@ class DisplayRefreshRateController(private val activity: Activity) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
             runCatching {
                 window.setFrameRateBoostOnTouchEnabled(true)
-                window.setFrameRatePowerSavingsBalanced(false)
-                window.decorView.requestedFrameRate =
-                    if (targetHz > 60f) targetHz else View.REQUESTED_FRAME_RATE_CATEGORY_HIGH
+                // Idle: let the system save power. Active: keep the native maximum.
+                window.setFrameRatePowerSavingsBalanced(isIdle)
+                window.decorView.requestedFrameRate = when {
+                    isIdle -> View.REQUESTED_FRAME_RATE_CATEGORY_NORMAL
+                    targetHz > 60f -> targetHz
+                    else -> View.REQUESTED_FRAME_RATE_CATEGORY_HIGH
+                }
             }
         }
 

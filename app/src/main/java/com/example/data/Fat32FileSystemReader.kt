@@ -26,6 +26,8 @@ class Fat32FileSystemReader(
     private val fatStartLba: Long
     private val dataStartLba: Long
     private val clusterSizeBytes: Int
+    /** Highest valid data cluster number for this volume (clusters run 2..maxCluster). */
+    private val maxCluster: Long
 
     private val fatSectorCache = HashMap<Long, ByteArray>()
 
@@ -43,17 +45,36 @@ class Fat32FileSystemReader(
         val fatSize32 = bb.getInt(36).toLong() and 0xFFFFFFFFL
         fatSizeSectors = if (fatSize16 != 0) fatSize16.toLong() else fatSize32
         rootCluster = bb.getInt(44).toLong() and 0x0FFFFFFFL
+        val totalSectors16 = bb.getShort(19).toLong() and 0xFFFFL
+        val totalSectors32 = bb.getInt(32).toLong() and 0xFFFFFFFFL
+        val volumeSectors = if (totalSectors16 != 0L) totalSectors16 else totalSectors32
 
         val fsTag = String(vbr, 82, 8, StandardCharsets.US_ASCII)
         if (bytesPerSector < 512 || sectorsPerCluster == 0 || fatSizeSectors == 0L || rootCluster < 2L ||
-            (!fsTag.startsWith("FAT32") && fatSize16 != 0)
+            (!fsTag.startsWith("FAT32") && fatSize16 != 0) ||
+            Integer.bitCount(sectorsPerCluster) != 1 || numFats == 0 || reservedSectors == 0
         ) {
             throw IOException("Partition at LBA $partitionStartLba is not a valid FAT32 volume.")
+        }
+        // All LBA math below is in volume sectors but reads are in device blocks: they must be the same size.
+        if (bytesPerSector != transport.blockSize) {
+            throw IOException(
+                "FAT32 volume uses $bytesPerSector-byte sectors but the drive uses ${transport.blockSize}-byte blocks. " +
+                    "Use folder access (SAF) to browse it."
+            )
         }
 
         fatStartLba = partitionStartLba + reservedSectors.toLong()
         dataStartLba = fatStartLba + (numFats.toLong() * fatSizeSectors)
         clusterSizeBytes = bytesPerSector * sectorsPerCluster
+
+        val volumeEnd = minOf(partitionStartLba + volumeSectors, transport.totalBlocks)
+        val dataSectors = volumeEnd - dataStartLba
+        val fatCapacity = fatSizeSectors * bytesPerSector / 4L - 1L
+        maxCluster = minOf(dataSectors / sectorsPerCluster + 1L, fatCapacity, 0x0FFFFFF6L)
+        if (dataSectors <= 0L || maxCluster < 2L || rootCluster > maxCluster) {
+            throw IOException("Partition at LBA $partitionStartLba has an invalid FAT32 layout.")
+        }
     }
 
     private data class FatEntry(
@@ -118,7 +139,7 @@ class Fat32FileSystemReader(
         var cluster = fileEntry.firstCluster
         var hops = 0
 
-        while (written < targetLen && cluster in 2L..0x0FFFFFF6L && hops < 4096) {
+        while (written < targetLen && cluster in 2L..maxCluster && hops < 4096) {
             val clusterBytes = readCluster(cluster)
             val copyLen = minOf(clusterBytes.size, targetLen - written)
             System.arraycopy(clusterBytes, 0, out, written, copyLen)
@@ -136,7 +157,7 @@ class Fat32FileSystemReader(
         var hops = 0
         var endReached = false
 
-        while (!endReached && cluster in 2L..0x0FFFFFF6L && hops < 512) {
+        while (!endReached && cluster in 2L..maxCluster && hops < 512) {
             val data = readCluster(cluster)
             var offset = 0
             while (offset + 32 <= data.size) {
@@ -176,6 +197,7 @@ class Fat32FileSystemReader(
                 lfnParts.clear()
 
                 if (fullName != "." && fullName != ".." && fullName.isNotBlank()) {
+                    val safeName = sanitizeName(fullName)
                     val bb = ByteBuffer.wrap(data, offset, 32).order(ByteOrder.LITTLE_ENDIAN)
                     val highClus = (bb.getShort(20).toInt() and 0xFFFF).toLong()
                     val lowClus = (bb.getShort(26).toInt() and 0xFFFF).toLong()
@@ -187,7 +209,7 @@ class Fat32FileSystemReader(
 
                     results.add(
                         FatEntry(
-                            name = fullName,
+                            name = safeName,
                             isDirectory = isDir,
                             firstCluster = firstClus,
                             sizeBytes = if (isDir) 0L else fileSize,
@@ -223,6 +245,21 @@ class Fat32FileSystemReader(
             .int
             .toLong() and 0x0FFFFFFFL
         return value
+    }
+
+    /**
+     * Names come from an untrusted drive. Replace path separators, control characters and
+     * bidirectional overrides (which can fake an extension, e.g. "exe.txt" shown as "txt.exe").
+     */
+    private fun sanitizeName(raw: String): String {
+        val sb = StringBuilder(raw.length)
+        for (ch in raw) {
+            val c = ch.code
+            val bad = c < 0x20 || c == 0x7F || ch == '/' || ch == '\\' ||
+                c in 0x202A..0x202E || c in 0x2066..0x2069 || c == 0x200E || c == 0x200F || c == 0x061C
+            sb.append(if (bad) '_' else ch)
+        }
+        return sb.toString()
     }
 
     private fun decodeLfnSegment(data: ByteArray, off: Int): String {

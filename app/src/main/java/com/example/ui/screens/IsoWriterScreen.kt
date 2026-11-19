@@ -32,6 +32,10 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
@@ -47,6 +51,7 @@ import com.example.ui.components.Md3BadgeVariant
 import com.example.ui.components.Md3Button
 import com.example.ui.components.Md3ButtonVariant
 import com.example.ui.components.Md3Card
+import com.example.ui.components.Md3ConfirmDialog
 import com.example.ui.components.Md3KeyValueRow
 import com.example.ui.components.Md3NoDriveEmptyState
 import com.example.ui.components.Md3ProgressBar
@@ -76,6 +81,8 @@ fun IsoWriterScreen(
     modifier: Modifier = Modifier
 ) {
     BackHandler(enabled = isCurrentTab) { onBackToDrives() }
+
+    var confirmFlash by remember { mutableStateOf(false) }
 
     if (drive == null) {
         Md3NoDriveEmptyState(
@@ -253,7 +260,7 @@ fun IsoWriterScreen(
                     icon = Icons.Outlined.Bolt,
                     variant = Md3ButtonVariant.GoldAccent,
                     enabled = hasSelectedImage && !flashStatus.isRunning,
-                    onClick = onExecuteFlash,
+                    onClick = { confirmFlash = true },
                     modifier = Modifier.fillMaxWidth(),
                     testTag = "execute_iso_flash_button"
                 )
@@ -264,7 +271,7 @@ fun IsoWriterScreen(
         if (flashStatus.errorMessage != null) {
             item {
                 Md3Alert(
-                    title = "Flash Failed",
+                    title = if (flashStatus.verifiedSuccess == false) "Verification Failed" else "Flash Failed",
                     description = flashStatus.errorMessage,
                     icon = Icons.Outlined.ErrorOutline,
                     variant = Md3BadgeVariant.Destructive
@@ -324,5 +331,28 @@ fun IsoWriterScreen(
                 }
             }
         }
+    }
+
+    if (confirmFlash) {
+        Md3ConfirmDialog(
+            title = "Write image to this drive?",
+            message = "The image overwrites the whole drive, including every partition and file on it. This cannot be undone.",
+            details = listOf(
+                "Image" to (customIsoName ?: "None"),
+                "Image size" to if (customIsoSize > 0L) formatBytes(customIsoSize) else "Unknown",
+                "Drive" to drive.name,
+                "Capacity" to if (drive.totalBytes > 0L) formatBytes(drive.totalBytes) else "Unknown",
+                "Serial" to drive.serialNumber,
+                "USB ID" to drive.vidPidHex
+            ),
+            confirmText = "Write",
+            requiredWord = "ERASE",
+            onConfirm = {
+                confirmFlash = false
+                onExecuteFlash()
+            },
+            onDismiss = { confirmFlash = false },
+            confirmTestTag = "confirm_iso_flash_button"
+        )
     }
 }

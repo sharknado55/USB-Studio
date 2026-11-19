@@ -1,6 +1,7 @@
 package com.example
 
 import com.example.util.RefreshRateModeSpec
+import com.example.util.selectIdleRefreshRateMode
 import com.example.util.selectOptimalRefreshRateMode
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -63,5 +64,28 @@ class DisplayRefreshRateTest {
         assertEquals(90f, selectOptimalRefreshRateMode(current90, modes)?.refreshRate)
         assertEquals(current90, selectOptimalRefreshRateMode(current90, emptyList()))
         assertNull(selectOptimalRefreshRateMode(null, emptyList()))
+    }
+
+    @Test
+    fun `idle mode picks 60Hz at the current resolution`() {
+        val current = RefreshRateModeSpec(modeId = 3, physicalWidth = 1080, physicalHeight = 2400, refreshRate = 120f)
+        val modes = listOf(
+            RefreshRateModeSpec(modeId = 1, physicalWidth = 1080, physicalHeight = 2400, refreshRate = 60f),
+            RefreshRateModeSpec(modeId = 2, physicalWidth = 1080, physicalHeight = 2400, refreshRate = 90f),
+            current,
+            RefreshRateModeSpec(modeId = 9, physicalWidth = 1440, physicalHeight = 3200, refreshRate = 60f)
+        )
+        assertEquals(1, selectIdleRefreshRateMode(current, modes)?.modeId)
+    }
+
+    @Test
+    fun `idle mode never drops below 60Hz when no exact 60Hz mode exists`() {
+        val current = RefreshRateModeSpec(modeId = 2, physicalWidth = 1080, physicalHeight = 2400, refreshRate = 120f)
+        val modes = listOf(
+            RefreshRateModeSpec(modeId = 1, physicalWidth = 1080, physicalHeight = 2400, refreshRate = 48f),
+            RefreshRateModeSpec(modeId = 3, physicalWidth = 1080, physicalHeight = 2400, refreshRate = 90f),
+            current
+        )
+        assertEquals(90f, selectIdleRefreshRateMode(current, modes)?.refreshRate)
     }
 }

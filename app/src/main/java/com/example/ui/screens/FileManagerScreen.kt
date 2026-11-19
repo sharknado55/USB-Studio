@@ -67,6 +67,7 @@ import com.example.ui.components.Md3BadgeVariant
 import com.example.ui.components.Md3Button
 import com.example.ui.components.Md3ButtonVariant
 import com.example.ui.components.Md3Card
+import com.example.ui.components.Md3ConfirmDialog
 import com.example.ui.components.Md3Input
 import com.example.ui.components.Md3NoDriveEmptyState
 import com.example.ui.theme.Coral400
@@ -117,6 +118,7 @@ fun FileManagerScreen(
     var showNewFolderDialog by remember { mutableStateOf(false) }
     var showNewFileDialog by remember { mutableStateOf(false) }
     var renameTarget by remember { mutableStateOf<UsbFileEntry?>(null) }
+    var deleteTarget by remember { mutableStateOf<UsbFileEntry?>(null) }
 
     if (drive == null) {
         Md3NoDriveEmptyState(
@@ -355,7 +357,7 @@ fun FileManagerScreen(
                         }
                     },
                     onRename = { renameTarget = entry },
-                    onDelete = { onDeleteEntry(entry) },
+                    onDelete = { deleteTarget = entry },
                     modifier = Modifier.animateItem()
                 )
             }
@@ -403,6 +405,30 @@ fun FileManagerScreen(
             onSave = { name, content ->
                 onSaveTextFile(name, content, editingFile)
             }
+        )
+    }
+
+    val activeDelete = deleteTarget
+    if (activeDelete != null) {
+        Md3ConfirmDialog(
+            title = if (activeDelete.isDirectory) "Delete this folder?" else "Delete this file?",
+            message = if (activeDelete.isDirectory) {
+                "The folder and everything inside it will be deleted. This cannot be undone."
+            } else {
+                "The file will be deleted. This cannot be undone."
+            },
+            details = listOf(
+                "Name" to activeDelete.name,
+                "Path" to activeDelete.path,
+                "Drive" to drive.name
+            ),
+            confirmText = "Delete",
+            onConfirm = {
+                deleteTarget = null
+                onDeleteEntry(activeDelete)
+            },
+            onDismiss = { deleteTarget = null },
+            confirmTestTag = "confirm_delete_button"
         )
     }
 

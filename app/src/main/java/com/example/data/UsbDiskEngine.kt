@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.StatFs
+import android.os.storage.StorageManager
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import com.example.model.DriveConnectionType
@@ -19,6 +20,8 @@ import com.example.model.UsbDriveDevice
 import com.example.model.UsbFileEntry
 import com.example.model.UsbPartition
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.IOException
@@ -35,7 +38,14 @@ class UsbDiskEngine(
         const val ACTION_USB_PERMISSION = "com.aistudio.usbstudio.USB_PERMISSION"
         private const val SECTOR_SIZE = 512
         private const val STREAM_BLOCK_CHUNK_SECTORS = 64 // 32 KB per SCSI WRITE/READ(10)
+        private const val EXTERNAL_STORAGE_AUTHORITY = "com.android.externalstorage.documents"
     }
+
+    /**
+     * Serializes every raw USB block session. Only one transport may own the device at a time:
+     * a second claimInterface(force = true) mid-write would interleave BOT traffic and corrupt the drive.
+     */
+    private val usbIoMutex = Mutex()
 
     private val usbManager: UsbManager? =
         context.getSystemService(Context.USB_SERVICE) as? UsbManager
@@ -74,6 +84,7 @@ class UsbDiskEngine(
             }
 
             var totalCapacity = existingHw?.totalBytes ?: 0L
+            var scsiCapacity = 0L
             var blockSize = existingHw?.logicalBlockSize ?: SECTOR_SIZE
             var protocolLabel = detectUsbProtocolName(usbDevice)
             var scheme = existingHw?.partitionScheme ?: PartitionScheme.MBR
@@ -85,8 +96,10 @@ class UsbDiskEngine(
 
             if (hasPerm) {
                 runCatching {
+                    usbIoMutex.withLock {
                     UsbScsiBlockTransport.open(usbManager, usbDevice).use { transport ->
                         totalCapacity = transport.totalBytes
+                        scsiCapacity = transport.totalBytes
                         blockSize = transport.blockSize
                         protocolLabel = "${detectUsbProtocolName(usbDevice)} • SCSI Direct"
                         if (transport.inquiryVendor.isNotBlank() && usbDevice.manufacturerName.isNullOrBlank()) {
@@ -98,6 +111,7 @@ class UsbDiskEngine(
                         val (probedScheme, probedParts) = BlockDiskStructures.readPartitionLayout(transport)
                         scheme = probedScheme
                         partitions = probedParts
+                    }
                     }
                 }
             }
@@ -141,6 +155,7 @@ class UsbDiskEngine(
                     hasUsbPermission = hasPerm,
                     totalBytes = totalCapacity,
                     logicalBlockSize = blockSize,
+                    scsiCapacityBytes = scsiCapacity,
                     partitionScheme = scheme,
                     partitions = partitions,
                     safTreeUri = linkedSafUri,
@@ -190,7 +205,7 @@ class UsbDiskEngine(
         }.getOrDefault(emptyList())
 
         for (uri in persistedUris) {
-            if (uri.toString() !in knownSafUris && isTreeUriAccessible(uri)) {
+            if (uri.toString() !in knownSafUris && isRemovableVolumeTree(uri) && isTreeUriAccessible(uri)) {
                 knownSafUris.add(uri.toString())
                 result.add(createSafMountedDrive(uri))
             }
@@ -234,7 +249,9 @@ class UsbDiskEngine(
      * Mounts an external USB / SD Card directory selected via Storage Access Framework (ACTION_OPEN_DOCUMENT_TREE).
      * Queries real volume metadata and capacity from DocumentsContract / StatFs with zero fake files.
      */
+    @Throws(IOException::class)
     suspend fun createSafMountedDrive(treeUri: Uri): UsbDriveDevice = withContext(Dispatchers.IO) {
+        requireRemovableVolumeTree(treeUri)
         runCatching {
             context.contentResolver.takePersistableUriPermission(
                 treeUri,
@@ -301,15 +318,21 @@ class UsbDiskEngine(
         lbaIndex: Long,
         sectorCount: Int = 1
     ): ByteArray = withContext(Dispatchers.IO) {
-        openBlockTransport(drive).use { transport ->
-            transport.readBlocks(lbaIndex.coerceAtLeast(0L), sectorCount.coerceAtLeast(1))
+        usbIoMutex.withLock {
+            openBlockTransport(drive).use { transport ->
+                transport.readBlocks(lbaIndex.coerceAtLeast(0L), sectorCount.coerceAtLeast(1))
+            }
         }
     }
 
     /**
-     * Formats a physical USB OTG drive directly over USB Mass Storage SCSI WRITE(10)
-     * (writing real MBR/GPT partition tables + real FAT32/exFAT/NTFS/EXT4 headers + SYNCHRONIZE CACHE),
+     * Formats a physical USB OTG drive directly over USB Mass Storage SCSI writes
+     * (real MBR/GPT partition table + real FAT32 volume + SYNCHRONIZE CACHE),
      * OR performs a real recursive SAF file/folder wipe on SAF-only volumes.
+     *
+     * With [wipeFullDrive] or no [targetPartitionId], the whole drive is rebuilt as one partition.
+     * Otherwise only the target partition's sectors are touched, after the on-disk table is re-read
+     * and checked against the layout the user saw.
      */
     @Throws(IOException::class)
     suspend fun formatDriveOrPartition(
@@ -331,6 +354,7 @@ class UsbDiskEngine(
         if (!drive.supportsRawBlockIo && injectedTransport == null) {
             val safUri = drive.safTreeUri
                 ?: throw IOException("No writable USB OTG device or SAF volume attached.")
+            requireRemovableVolumeTree(safUri)
 
             onProgress(0.15f, "Scanning files and folders on ${drive.name}...")
             val deletedCount = clearSafTreeChildren(safUri) { fraction, itemName ->
@@ -341,44 +365,49 @@ class UsbDiskEngine(
             return@withContext drive.copy(partitions = updatedPartitions) to "SAF-WIPED"
         }
 
+        if (!fileSystem.canFormat) {
+            injectedTransport?.close()
+            throw IOException("Creating ${fileSystem.label} volumes is not supported. Use FAT32.")
+        }
+
         // Case 2: Physical USB OTG drive (or injected test block transport) -> REAL SCSI block writes!
         onProgress(0.08f, "Claiming USB Mass Storage interface for ${drive.name}...")
-        (injectedTransport ?: openBlockTransport(drive)).use { transport ->
-            val blockSize = transport.blockSize
-            val totalBlocks = transport.totalBlocks
-            val totalBytes = transport.totalBytes
-
-            if (!quickFormat) {
-                // Zero-wipe MBR/GPT, first 4 MB (8192 sectors) of volume headers/FAT tables, and backup GPT tail
-                onProgress(0.18f, "Zero-wiping partition headers, FAT regions & backup GPT...")
+        usbIoMutex.withLock {
+            (injectedTransport ?: openBlockTransport(drive)).use { transport ->
+                BlockDiskStructures.requireSupportedSectorSize(transport)
+                val blockSize = transport.blockSize
+                val totalBlocks = transport.totalBlocks
                 val zeroChunk = ByteArray(blockSize * STREAM_BLOCK_CHUNK_SECTORS)
-                val wipeSectors = minOf(8192L, totalBlocks)
-                var lba = 0L
-                while (lba < wipeSectors) {
-                    val count = minOf(STREAM_BLOCK_CHUNK_SECTORS.toLong(), wipeSectors - lba).toInt()
-                    val buf = if (count == STREAM_BLOCK_CHUNK_SECTORS) zeroChunk else ByteArray(count * blockSize)
-                    transport.writeBlocks(lba, buf)
-                    lba += count
-                    val frac = lba.toFloat() / wipeSectors.toFloat()
-                    onProgress(0.18f + frac * 0.30f, "Zeroing LBA $lba / $wipeSectors...")
-                }
-                if (totalBlocks > 64L) {
-                    val tailStart = totalBlocks - 34L
-                    transport.writeBlocks(tailStart, ByteArray(34 * blockSize))
-                }
-            } else {
-                onProgress(0.25f, "Clearing existing partition signatures & boot sectors...")
-                val clearHeaderSectors = minOf(64L, totalBlocks).toInt()
-                transport.writeBlocks(0L, ByteArray(clearHeaderSectors * blockSize))
-            }
 
-            val startLba = if (totalBlocks > 4096L) 2048L else 64L
-            val usableSectors = (totalBlocks - startLba - if (partitionScheme == PartitionScheme.GPT) 34L else 0L)
-                .coerceAtLeast(1L)
+                fun zeroRange(start: Long, count: Long, progressFrom: Float, progressSpan: Float) {
+                    var lba = start
+                    val end = start + count
+                    while (lba < end) {
+                        val n = minOf(STREAM_BLOCK_CHUNK_SECTORS.toLong(), end - lba).toInt()
+                        transport.writeBlocks(lba, if (n == STREAM_BLOCK_CHUNK_SECTORS) zeroChunk else ByteArray(n * blockSize))
+                        lba += n
+                        onProgress(progressFrom + progressSpan * ((lba - start).toFloat() / count.toFloat()), "Zeroing LBA $lba / $end...")
+                    }
+                }
 
-            val updatedPartitions = if (wipeFullDrive || targetPartitionId == null || drive.partitions.isEmpty()) {
-                listOf(
-                    UsbPartition(
+                val wholeDrive = wipeFullDrive || targetPartitionId == null
+                val writtenScheme: PartitionScheme
+                val writtenPartitions: List<UsbPartition>
+                val formattedTarget: UsbPartition
+
+                if (wholeDrive) {
+                    val startLba = if (totalBlocks > 4096L) 2048L else 64L
+                    // Always leave room for a backup GPT so the layout stays valid if converted later.
+                    val usableSectors = totalBlocks - startLba - 34L
+                    BlockDiskStructures.validateFat32Geometry(usableSectors, clusterSize)
+
+                    onProgress(0.18f, "Zero-wiping partition headers & backup GPT...")
+                    zeroRange(0L, minOf(if (quickFormat) 64L else 8192L, totalBlocks), 0.18f, 0.30f)
+                    if (totalBlocks > 64L) {
+                        transport.writeBlocks(totalBlocks - 34L, ByteArray(34 * blockSize))
+                    }
+
+                    formattedTarget = UsbPartition(
                         id = "part_${UUID.randomUUID().toString().take(6)}",
                         index = 1,
                         label = cleanLabel,
@@ -396,58 +425,83 @@ class UsbDiskEngine(
                         },
                         uuid = newUuid
                     )
-                )
-            } else {
-                drive.partitions.map { part ->
-                    if (part.id == targetPartitionId) {
-                        part.copy(
-                            label = cleanLabel,
-                            fileSystem = fileSystem,
-                            usedBytes = 0L,
-                            flags = listOf("FORMATTED", "${clusterSize / 1024}K_CLUSTER"),
-                            uuid = newUuid
+                    writtenScheme = partitionScheme
+                    writtenPartitions = listOf(formattedTarget)
+                } else {
+                    onProgress(0.12f, "Re-reading the partition table from ${drive.name}...")
+                    val (diskScheme, diskParts) = BlockDiskStructures.readPartitionLayout(transport)
+                    requireLayoutMatches(drive.partitions, diskParts)
+                    if (partitionScheme != diskScheme) {
+                        throw IOException(
+                            "Changing the partition scheme needs a whole-drive format. " +
+                                "Turn on 'Wipe full drive' or convert the scheme in the Partitions tab."
                         )
-                    } else part
+                    }
+                    val modelTarget = drive.partitions.find { it.id == targetPartitionId }
+                    val target = diskParts.find {
+                        modelTarget != null && it.fileSystem != FileSystemType.UNALLOCATED &&
+                            it.startLba == modelTarget.startLba && it.sectorCount == modelTarget.sectorCount
+                    } ?: throw IOException("The selected partition is not on the drive any more. Rescan and select it again.")
+                    if (BlockDiskStructures.FLAG_OUT_OF_BOUNDS in target.flags ||
+                        BlockDiskStructures.FLAG_EXTENDED in target.flags
+                    ) {
+                        throw IOException("Partition '${target.label}' cannot be formatted on its own. Format the whole drive instead.")
+                    }
+                    BlockDiskStructures.validateFat32Geometry(target.sectorCount, clusterSize)
+
+                    // Only this partition's own sectors are cleared; other partitions are never touched.
+                    onProgress(0.18f, "Clearing old volume headers of '${target.label}'...")
+                    zeroRange(target.startLba, minOf(if (quickFormat) 64L else 8192L, target.sectorCount), 0.18f, 0.30f)
+
+                    val fsChanged = target.fileSystem != fileSystem
+                    formattedTarget = target.copy(
+                        label = cleanLabel,
+                        fileSystem = fileSystem,
+                        usedBytes = 0L,
+                        flags = listOf("FORMATTED", "${clusterSize / 1024}K_CLUSTER"),
+                        uuid = newUuid,
+                        mbrTypeCode = if (fsChanged) null else target.mbrTypeCode,
+                        gptTypeGuid = if (fsChanged) null else target.gptTypeGuid
+                    )
+                    writtenScheme = diskScheme
+                    writtenPartitions = diskParts.map { if (it.id == target.id) formattedTarget else it }
                 }
+
+                onProgress(0.58f, "Writing ${writtenScheme.name} partition table...")
+                BlockDiskStructures.writePartitionTable(transport, writtenScheme, writtenPartitions)
+
+                onProgress(0.78f, "Writing ${fileSystem.label} filesystem structures at LBA ${formattedTarget.startLba}...")
+                BlockDiskStructures.writeFileSystemAtPartition(
+                    transport = transport,
+                    startLba = formattedTarget.startLba,
+                    sectorCount = formattedTarget.sectorCount,
+                    fileSystem = fileSystem,
+                    volumeLabel = cleanLabel,
+                    clusterSize = clusterSize,
+                    uuid = newUuid
+                )
+
+                onProgress(0.94f, "Flushing USB drive write cache (SYNCHRONIZE CACHE)...")
+                transport.syncCache()
+
+                val (finalScheme, finalParts) = runCatching { BlockDiskStructures.readPartitionLayout(transport) }
+                    .getOrDefault(writtenScheme to writtenPartitions)
+
+                onProgress(1.0f, "Formatted $cleanLabel as ${fileSystem.label} ($newUuid)")
+                drive.copy(
+                    totalBytes = transport.totalBytes,
+                    logicalBlockSize = blockSize,
+                    partitionScheme = finalScheme,
+                    partitions = finalParts
+                ) to newUuid
             }
-
-            onProgress(0.58f, "Writing ${partitionScheme.name} partition table to LBA 0..33...")
-            BlockDiskStructures.writePartitionTable(transport, partitionScheme, updatedPartitions)
-
-            val formattedTarget = if (wipeFullDrive || targetPartitionId == null) {
-                updatedPartitions.first()
-            } else {
-                updatedPartitions.find { it.id == targetPartitionId } ?: updatedPartitions.first()
-            }
-
-            onProgress(0.78f, "Writing ${fileSystem.label} filesystem structures at LBA ${formattedTarget.startLba}...")
-            BlockDiskStructures.writeFileSystemAtPartition(
-                transport = transport,
-                startLba = formattedTarget.startLba,
-                sectorCount = formattedTarget.sectorCount,
-                fileSystem = fileSystem,
-                volumeLabel = cleanLabel,
-                clusterSize = clusterSize,
-                uuid = newUuid
-            )
-
-            onProgress(0.94f, "Flushing USB drive write cache (SYNCHRONIZE CACHE)...")
-            transport.syncCache()
-
-            onProgress(1.0f, "Formatted $cleanLabel as ${fileSystem.label} ($newUuid)")
-            val updatedDrive = drive.copy(
-                totalBytes = totalBytes,
-                logicalBlockSize = blockSize,
-                partitionScheme = partitionScheme,
-                partitions = updatedPartitions
-            )
-            updatedDrive to newUuid
         }
     }
 
     /**
      * Commits a modified Partition Table (new partitions, deleted partitions, or scheme conversion MBR <-> GPT)
-     * directly to the physical USB drive's LBA 0..33 sectors and formats any newly created partitions.
+     * to the physical USB drive and formats any newly created partitions. The on-disk table is re-read
+     * first and must still match what the user edited; the new layout is validated before any write.
      */
     @Throws(IOException::class)
     suspend fun commitPartitionTable(
@@ -455,33 +509,61 @@ class UsbDiskEngine(
         newScheme: PartitionScheme,
         newPartitions: List<UsbPartition>
     ): UsbDriveDevice = withContext(Dispatchers.IO) {
-        openBlockTransport(drive).use { transport ->
-            val oldIds = drive.partitions.map { it.id }.toSet()
+        usbIoMutex.withLock {
+            openBlockTransport(drive).use { transport ->
+                val oldIds = drive.partitions.map { it.id }.toSet()
+                val created = newPartitions.filter { it.fileSystem != FileSystemType.UNALLOCATED && it.id !in oldIds }
+                created.forEach { part ->
+                    if (!part.fileSystem.canFormat) {
+                        throw IOException("Creating ${part.fileSystem.label} partitions is not supported. Use FAT32.")
+                    }
+                    BlockDiskStructures.validateFat32Geometry(part.sectorCount, part.fileSystem.clusterSizes.first())
+                }
 
-            BlockDiskStructures.writePartitionTable(transport, newScheme, newPartitions)
+                val (_, diskParts) = BlockDiskStructures.readPartitionLayout(transport)
+                requireLayoutMatches(drive.partitions, diskParts)
+                BlockDiskStructures.validateLayout(transport, newScheme, newPartitions)
 
-            // Initialize filesystem headers for newly created partitions
-            newPartitions
-                .filter { it.fileSystem != FileSystemType.UNALLOCATED && it.id !in oldIds }
-                .forEach { newPart ->
+                BlockDiskStructures.writePartitionTable(transport, newScheme, newPartitions)
+
+                // Initialize filesystem headers for newly created partitions
+                created.forEach { newPart ->
                     BlockDiskStructures.writeFileSystemAtPartition(
                         transport = transport,
                         startLba = newPart.startLba,
                         sectorCount = newPart.sectorCount,
                         fileSystem = newPart.fileSystem,
                         volumeLabel = newPart.label,
-                        clusterSize = newPart.fileSystem.clusterSizes.firstOrNull() ?: 4096,
+                        clusterSize = newPart.fileSystem.clusterSizes.first(),
                         uuid = newPart.uuid
                     )
                 }
 
-            transport.syncCache()
+                transport.syncCache()
 
-            drive.copy(
-                totalBytes = transport.totalBytes,
-                logicalBlockSize = transport.blockSize,
-                partitionScheme = newScheme,
-                partitions = newPartitions
+                val (finalScheme, finalParts) = runCatching { BlockDiskStructures.readPartitionLayout(transport) }
+                    .getOrDefault(newScheme to newPartitions)
+                drive.copy(
+                    totalBytes = transport.totalBytes,
+                    logicalBlockSize = transport.blockSize,
+                    partitionScheme = finalScheme,
+                    partitions = finalParts
+                )
+            }
+        }
+    }
+
+    /** Fails unless the allocated partitions on disk are exactly the ones in the app's model. */
+    @Throws(IOException::class)
+    private fun requireLayoutMatches(model: List<UsbPartition>, onDisk: List<UsbPartition>) {
+        fun ranges(list: List<UsbPartition>) = list
+            .filter { it.fileSystem != FileSystemType.UNALLOCATED }
+            .map { it.startLba to it.sectorCount }
+            .toSet()
+        if (ranges(model) != ranges(onDisk)) {
+            throw IOException(
+                "The partition table on the drive differs from the one shown in the app. " +
+                    "Rescan the drive and check your selection before writing."
             )
         }
     }
@@ -511,6 +593,7 @@ class UsbDiskEngine(
 
         onStatus("Claiming USB block device...", 0.02f, 0L, queriedSize.coerceAtLeast(1L), 0f)
 
+        usbIoMutex.withLock {
         openBlockTransport(drive).use { transport ->
             val blockSize = transport.blockSize
             val chunkBytesSize = STREAM_BLOCK_CHUNK_SECTORS * blockSize
@@ -667,6 +750,7 @@ class UsbDiskEngine(
 
             Triple(updatedDrive, expectedSha256, verified)
         }
+        }
     }
 
     // =========================================================================
@@ -686,18 +770,20 @@ class UsbDiskEngine(
         }
 
         // 2. Direct USB SCSI FAT32 read-only fallback when hardware is connected without SAF mounted
-        val directTransport = blockTransportFactory?.invoke(drive)
-            ?: if (drive.supportsRawBlockIo) openBlockTransport(drive) else null
-        if (directTransport != null) {
-            directTransport.use { transport ->
-                val fat32Part = drive.partitions.firstOrNull { it.fileSystem == FileSystemType.FAT32 }
-                    ?: BlockDiskStructures.readPartitionLayout(transport).second
-                        .firstOrNull { it.fileSystem == FileSystemType.FAT32 }
-                if (fat32Part != null) {
-                    val reader = Fat32FileSystemReader(transport, fat32Part.startLba)
-                    return@withContext reader.listDirectory(relativePath)
+        if (blockTransportFactory != null || drive.supportsRawBlockIo) {
+            usbIoMutex.withLock {
+                val directTransport = blockTransportFactory?.invoke(drive)
+                    ?: if (drive.supportsRawBlockIo) openBlockTransport(drive) else null
+                directTransport?.use { transport ->
+                    val fat32Part = drive.partitions.firstOrNull { it.fileSystem == FileSystemType.FAT32 }
+                        ?: BlockDiskStructures.readPartitionLayout(transport).second
+                            .firstOrNull { it.fileSystem == FileSystemType.FAT32 }
+                    if (fat32Part != null) {
+                        val reader = Fat32FileSystemReader(transport, fat32Part.startLba)
+                        return@withContext reader.listDirectory(relativePath)
+                    }
+                    throw IOException("Direct raw browsing supports FAT32 partitions. Tap 'Mount Folder Access (SAF)' to browse & edit files on ${drive.primaryFileSystem.label} volumes.")
                 }
-                throw IOException("Direct raw browsing supports FAT32 partitions. Tap 'Mount Folder Access (SAF)' to browse & edit files on ${drive.primaryFileSystem.label} volumes.")
             }
         }
 
@@ -804,16 +890,18 @@ class UsbDiskEngine(
             return@withContext readBytesFromContentUri(docUri, maxBytes)
         }
 
-        val directTransport = blockTransportFactory?.invoke(drive)
-            ?: if (drive.supportsRawBlockIo) openBlockTransport(drive) else null
-        if (directTransport != null) {
-            directTransport.use { transport ->
-                val fat32Part = drive.partitions.firstOrNull { it.fileSystem == FileSystemType.FAT32 }
-                    ?: BlockDiskStructures.readPartitionLayout(transport).second
-                        .firstOrNull { it.fileSystem == FileSystemType.FAT32 }
-                    ?: throw IOException("No readable FAT32 partition found.")
-                return@withContext Fat32FileSystemReader(transport, fat32Part.startLba)
-                    .readFileBytes(entry.path, maxBytes)
+        if (blockTransportFactory != null || drive.supportsRawBlockIo) {
+            usbIoMutex.withLock {
+                val directTransport = blockTransportFactory?.invoke(drive)
+                    ?: if (drive.supportsRawBlockIo) openBlockTransport(drive) else null
+                directTransport?.use { transport ->
+                    val fat32Part = drive.partitions.firstOrNull { it.fileSystem == FileSystemType.FAT32 }
+                        ?: BlockDiskStructures.readPartitionLayout(transport).second
+                            .firstOrNull { it.fileSystem == FileSystemType.FAT32 }
+                        ?: throw IOException("No readable FAT32 partition found.")
+                    return@withContext Fat32FileSystemReader(transport, fat32Part.startLba)
+                        .readFileBytes(entry.path, maxBytes)
+                }
             }
         }
 
@@ -929,7 +1017,68 @@ class UsbDiskEngine(
             throw IOException("USB Host permission not granted for ${drive.name}. Tap 'Grant USB Access' on the Drives tab.")
         }
 
-        return UsbScsiBlockTransport.open(manager, usbDevice)
+        // The device name is only a bus path; make sure the same physical drive is still behind it.
+        val mismatch = "The USB device now connected is not the drive you selected (${drive.name}). Rescan and select the drive again."
+        if (usbDevice.vendorId != drive.vendorId || usbDevice.productId != drive.productId) {
+            throw IOException(mismatch)
+        }
+        val liveSerial = runCatching { usbDevice.serialNumber }.getOrNull()
+            ?: String.format("VID%04X-PID%04X", usbDevice.vendorId and 0xFFFF, usbDevice.productId and 0xFFFF)
+        if (liveSerial != drive.serialNumber) {
+            throw IOException(mismatch)
+        }
+
+        val transport = UsbScsiBlockTransport.open(manager, usbDevice)
+        if (drive.scsiCapacityBytes > 0L && transport.totalBytes != drive.scsiCapacityBytes) {
+            transport.close()
+            throw IOException(mismatch)
+        }
+        return transport
+    }
+
+    // =========================================================================
+    // Removable-volume checks for SAF trees
+    // =========================================================================
+
+    /**
+     * Throws unless [treeUri] is a folder on a removable volume (USB drive or SD card) served by the
+     * system ExternalStorageProvider. Internal storage, Downloads and other providers are refused, so
+     * "Erase All Files" and file deletes can never reach the phone's own storage.
+     */
+    @Throws(IOException::class)
+    fun requireRemovableVolumeTree(treeUri: Uri) {
+        val notRemovable = "That folder is not on a USB drive or SD card. Pick the USB drive itself in the folder picker."
+        if (treeUri.authority != EXTERNAL_STORAGE_AUTHORITY) throw IOException(notRemovable)
+        val docId = runCatching { DocumentsContract.getTreeDocumentId(treeUri) }.getOrNull()
+            ?: throw IOException(notRemovable)
+        val volumeKey = docId.substringBefore(':', "")
+        if (volumeKey.isBlank() || volumeKey.equals("primary", ignoreCase = true) ||
+            volumeKey.equals("home", ignoreCase = true)
+        ) {
+            throw IOException(notRemovable)
+        }
+        val storageManager = context.getSystemService(Context.STORAGE_SERVICE) as? StorageManager
+        val volume = runCatching {
+            storageManager?.storageVolumes?.firstOrNull { it.uuid.equals(volumeKey, ignoreCase = true) }
+        }.getOrNull()
+        if (volume != null && (volume.isPrimary || !volume.isRemovable)) {
+            throw IOException(notRemovable)
+        }
+    }
+
+    private fun isRemovableVolumeTree(treeUri: Uri): Boolean =
+        runCatching { requireRemovableVolumeTree(treeUri) }.isSuccess
+
+    /**
+     * True unless the SAF volume's size clearly cannot belong to [drive] (bigger than the drive, or
+     * less than half of it). Used before linking a folder tree to a hardware drive.
+     */
+    suspend fun safTreeFitsDrive(treeUri: Uri, drive: UsbDriveDevice): Boolean = withContext(Dispatchers.IO) {
+        val docId = runCatching { DocumentsContract.getTreeDocumentId(treeUri) }.getOrDefault("")
+        val safTotal = querySafVolumeStats(treeUri, docId.substringBefore(':')).totalBytes
+        val driveTotal = drive.scsiCapacityBytes
+        if (safTotal <= 0L || driveTotal <= 0L) return@withContext true
+        safTotal <= driveTotal && safTotal >= driveTotal / 2
     }
 
     // =========================================================================
