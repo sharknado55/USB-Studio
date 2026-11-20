@@ -44,3 +44,7 @@ Use Android Studio’s **Generate Signed App Bundle or APK** wizard or set `KEYS
 Gradle writes the APK to `app/build/outputs/apk/release/` and the AAB to `app/build/outputs/bundle/release/`. Build with the release key to distribute an installable APK.
 
 Before distribution, verify USB attach and permissions, file reads and writes, partitioning, formatting, and image writing on a physical Android device with a spare USB drive. Formatting, partition changes, and image writing can erase data.
+
+## License
+
+USB Studio is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE). You may use, modify and share it for noncommercial purposes. Commercial use is not permitted.
